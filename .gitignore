@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environments
+.venv/
+venv/
+
+# Archives
+*.zip
+*.7z
+
+
+# OS
+.DS_Store
+Thumbs.db
