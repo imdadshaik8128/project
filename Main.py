@@ -520,12 +520,12 @@ def main() -> None:
             continue
 
         if cmd == "history":
-            history = memory_graph.get_history(student_id)
+            history = memory_graph.get_history(student_id, active_subject)
             display_history(history, student_id)
             continue
 
         if cmd == "summary":
-            summary = memory_graph.get_session_summary(student_id)
+            summary = memory_graph.get_session_summary(student_id, active_subject)
             display_summary(summary, student_id)
             continue
 

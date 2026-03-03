@@ -40,7 +40,7 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
 log = logging.getLogger(__name__)
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-OLLAMA_MODEL       = "qwen2.5:0.5b-instruct"
+OLLAMA_MODEL       = "mistral"
 LLM_TIMEOUT        = 60
 CONFIDENCE_FLOOR   = 0.40
 REFERENCE_CONFIDENCE = 1.0
