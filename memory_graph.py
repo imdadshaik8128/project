@@ -123,6 +123,14 @@ ANSWER_THRESHOLD = 0.30
 # Set to 2 — raise to 3 if you want more tolerance before resetting.
 DRIFT_RESET_AFTER = 2
 
+# ── Max lock window ────────────────────────────────────────────────────────────
+# Absolute ceiling: even if drift counter never reaches DRIFT_RESET_AFTER
+# (e.g. student mixes semi-related queries that keep scoring above threshold),
+# the chapter lock is forcibly released after MAX_LOCK_TURNS turns from when
+# it was first acquired.  Prevents stale memory in very long single-topic sessions.
+# Raise to 8-10 for deeper study sessions; lower to 4 for shorter attention spans.
+MAX_LOCK_TURNS = 6
+
 # ── Intent-only query pattern ──────────────────────────────────────────────────
 # Pure continuation signals with zero semantic domain content.
 # Similarity scoring is useless for these — they have no subject-area words.
@@ -138,6 +146,20 @@ DRIFT_RESET_AFTER = 2
 # queries cannot accidentally fire.
 _INTENT_ONLY = re.compile(
     r"^\s*("
+    # ── Acknowledgements / affirmations ───────────────────────────────────────
+    # Content-free responses that can only be continuations, never topic queries.
+    # "ok", "yes", "got it", "i see" contain zero domain vocabulary.
+    r"ok\??"
+    r"|okay\??"
+    r"|yes\??"
+    r"|sure\??"
+    r"|cool\??"
+    r"|nice\??"
+    r"|got\s+it\??"
+    r"|i\s+see\??"
+    r"|alright\??"
+    r"|understood\??"
+    r"|makes\s+sense\??"
     # ── Pure single-word / short continuations ─────────────────────────────
     r"why\??"
     r"|elaborate\??"
@@ -230,6 +252,7 @@ class RAGState(TypedDict):
     # Current turn — retrieval
     last_chapter_number: Optional[str]
     last_chapter_title:  Optional[str]
+    last_section_title:  Optional[str]   # section from top chunk — PRIMARY similarity anchor
     last_chunk_ids:      list[str]
     last_chunk_scores:   list[float]
     last_filter_path:    Optional[str]
@@ -247,7 +270,8 @@ class RAGState(TypedDict):
 
     # Session bookkeeping
     turn_count:              int
-    consecutive_fresh_turns: int   # drift-reset counter (FIX 4)
+    consecutive_fresh_turns: int        # drift-reset counter
+    lock_start_turn:         Optional[int]  # turn_count when chapter lock was acquired
     error:                   Optional[str]
     retrieved_chunks:        list[dict]   # transient — cleared each turn
 
@@ -348,11 +372,40 @@ def _check_followup(
             log.info("Memory | intent_only %r — no context yet", query)
             return False, 0.0, "no_context", empty_scores
 
+    # ── Typo-tolerant intent-only fallback ─────────────────────────────
+    # Handles small typos like:
+    # "explin it in detail", "explane more", etc.
+    # Only triggers for short vague queries (<= 4 words).
+    normalized = query.lower().strip()
+
+    if (
+        len(normalized.split()) <= 4
+        and any(word in normalized for word in ["explain", "detail", "again", "more"])
+    ):
+        if state.get("last_chapter_number"):
+            log.info("Memory | fuzzy intent-only detected — forcing follow-up")
+            return True, 1.0, "intent_only", {
+                "title": 1.0,
+                "query": 1.0,
+                "answer": 1.0,
+                "title_hit": True,
+                "query_hit": True,
+                "answer_hit": True,
+            }
+    
     # ── Priority 3: no previous context ──────────────────────────────────────
-    last_title  = state.get("last_chapter_title")  or ""
+    # Anchor 1 uses section_title as PRIMARY (more precise than chapter title).
+    # Falls back to chapter_title when section is unavailable (e.g. first turn
+    # of a new topic, or chunks that have no section_title in metadata).
+    # Same TITLE_THRESHOLD (0.25) applies — section titles are equally short/precise.
+    last_title  = (
+        state.get("last_section_title")
+        or state.get("last_chapter_title")
+        or ""
+    )
     last_answer = state.get("last_spoken_answer")  or ""
-    # FIX 3: use prev_query (previous turn's query), NOT last_query
-    # (last_query in state IS the current query by the time parse_node runs)
+    # Use prev_query (previous turn's query), NOT last_query.
+    # last_query in state IS the current query by the time parse_node runs.
     prev_q = state.get("prev_query") or ""
 
     if not state.get("last_chapter_number") or (not last_answer and not last_title):
@@ -363,8 +416,11 @@ def _check_followup(
     try:
         q_vec = embed_fn(query)
 
-        # Anchor 1 — chapter title
-        # Short, precise. Low threshold (0.25) is safe.
+        # Anchor 1 — section title (primary) or chapter title (fallback)
+        # Section title is more precise than chapter title, giving a stronger
+        # hit signal for follow-ups within a specific section.
+        # Example: last_section_title = "3.2 The Heart - Chambers and Valves"
+        #          query = "explain the valves" → sim ≈ 0.41 >> 0.25 threshold ✓
         sim_title = 0.0
         if last_title:
             sim_title = _cosine(q_vec, embed_fn(_strip_latex(last_title)))
@@ -480,6 +536,8 @@ def parse_node(state: RAGState, retriever: Retriever) -> dict:
 
         # Apply drift reset when threshold reached
         chapter_locked = state.get("last_chapter_number")
+        drift_fired    = False
+
         if new_fresh_count >= DRIFT_RESET_AFTER and chapter_locked:
             log.info(
                 "Memory | DRIFT RESET after %d consecutive fresh turns — "
@@ -487,22 +545,57 @@ def parse_node(state: RAGState, retriever: Retriever) -> dict:
                 new_fresh_count, chapter_locked,
             )
             parsed["chapter_number"] = None   # ensure this turn retrieves fresh
+            drift_fired = True
+
+        # ── Max lock window enforcement ───────────────────────────────────────
+        # Even if drift never reaches DRIFT_RESET_AFTER, the chapter lock cannot
+        # stay active indefinitely.  After MAX_LOCK_TURNS turns from acquisition,
+        # force unlock.  This prevents sticky memory in long single-topic sessions
+        # where the student keeps asking semi-related questions.
+        lock_start_turn = state.get("lock_start_turn")
+        current_turn    = state.get("turn_count", 0)
+        max_lock_fired  = False
+
+        if (
+            not drift_fired
+            and chapter_locked
+            and lock_start_turn is not None
+            and (current_turn - lock_start_turn) >= MAX_LOCK_TURNS
+        ):
+            log.info(
+                "Memory | MAX LOCK window reached — %d turns since lock "
+                "(lock_start=%d, now=%d) — forcing unlock (was chapter=%s)",
+                current_turn - lock_start_turn, lock_start_turn,
+                current_turn, chapter_locked,
+            )
+            parsed["chapter_number"] = None
+            lock_start_turn = None   # clear it so it resets on next injection
+            max_lock_fired  = True
 
         # ── Step 4: Chapter + Topic injection ────────────────────────────────
         # Only inject when:
         #   - follow-up detected
         #   - SLM found no explicit chapter in the query
-        #   - drift reset did NOT just fire
+        #   - neither drift reset nor max-lock fired
         injected_chapter = None
         injected_topic   = None
 
         if is_followup and parsed.get("chapter_number") is None:
-            if new_fresh_count < DRIFT_RESET_AFTER:
+            if not drift_fired and not max_lock_fired:
                 prev_chapter = state.get("last_chapter_number")
                 if prev_chapter:
                     try:
                         parsed["chapter_number"] = int(prev_chapter)
                         injected_chapter = parsed["chapter_number"]
+                        # Record when this lock was first acquired.
+                        # Only set once — do not overwrite an existing lock_start_turn.
+                        if lock_start_turn is None:
+                            lock_start_turn = current_turn
+                            log.info(
+                                "Memory | chapter lock acquired — "
+                                "chapter=%s, lock_start_turn=%d",
+                                injected_chapter, lock_start_turn,
+                            )
                     except (ValueError, TypeError):
                         log.warning(
                             "Memory | could not cast last_chapter_number=%r to int",
@@ -573,34 +666,39 @@ def parse_node(state: RAGState, retriever: Retriever) -> dict:
         log.info("Parsed: %s", json.dumps(parsed))
 
         # ── Step 6: Build enriched retrieval query ────────────────────────────
-        # Problem: when memory is used, the student's query is vague ("explain it",
-        # "elaborate", "what does that mean"). The bi-encoder inside retrieve_node
-        # embeds this vague text and finds poor semantic matches even within the
-        # correct chapter, because there are no domain words to anchor on.
+        # For follow-up turns the student query is vague ("explain it",
+        # "elaborate", "ok", "got it").  The bi-encoder has no domain words
+        # to work with and drifts within the chapter.
         #
-        # Solution: for follow-up turns, prepend prev_query so the bi-encoder
-        # receives the full semantic context of what "it" / "that" refers to.
+        # Solution: prefix with last_topic (stable domain vocabulary the SLM
+        # extracted from the first query) and prev_query (previous intent),
+        # then append the current vague query.
         #
-        # Examples:
-        #   "explain it"        + "explain how the heart works"
-        #   → "explain how the heart works explain it"
-        #   → bi-encoder now finds heart/circulatory chunks reliably ✓
+        # Order: topic → prev_query → current_query
+        # Rationale:
+        #   topic      = most stable, clean noun phrase ("The Heart's Function")
+        #   prev_query = sentence-level domain context ("explain how the heart works")
+        #   current    = intent signal ("explain it in detail")
         #
-        #   "elaborate"         + "explain acids and bases"
-        #   → "explain acids and bases elaborate"
-        #   → correct chapter section retrieved ✓
+        # Example:
+        #   topic      = "The Heart's Function and Structure"
+        #   prev_query = "explain how the heart works"
+        #   query      = "explain it in detail"
+        #   → retrieval_query = "The Heart's Function and Structure explain how the heart works explain it in detail"
+        #   → bi-encoder finds circulatory chunks reliably ✓
         #
-        # For fresh / hard_anchor / no_context: use raw query unchanged.
-        # Hard-anchor queries already contain the chapter and topic.
-        # Fresh queries have domain words and do not need enrichment.
-        is_followup_turn = reason in ("intent_only", "semantic")
+        # For fresh/hard_anchor/no_context: raw query unchanged (has domain words).
+        is_followup_turn      = reason in ("intent_only", "semantic")
         prev_q_for_enrichment = state.get("prev_query") or ""
+        last_topic_for_enrich = (state.get("last_parsed") or {}).get("topic", "").strip()
 
         if is_followup_turn and prev_q_for_enrichment:
-            retrieval_query = f"{prev_q_for_enrichment} {query}"
+            parts           = [p for p in [last_topic_for_enrich, prev_q_for_enrichment, query] if p]
+            retrieval_query = " ".join(parts)
             log.info(
-                "Memory | retrieval_query enriched: %r + %r → %r",
-                prev_q_for_enrichment, query, retrieval_query,
+                "Memory | retrieval_query enriched — "
+                "topic=%r  prev=%r  cur=%r  → %r",
+                last_topic_for_enrich, prev_q_for_enrichment, query, retrieval_query,
             )
         else:
             retrieval_query = query
@@ -612,6 +710,7 @@ def parse_node(state: RAGState, retriever: Retriever) -> dict:
             "last_similarity":          float(similarity),
             "memory_used":              reason,
             "consecutive_fresh_turns":  new_fresh_count,
+            "lock_start_turn":          lock_start_turn,
             "error":                    None,
         }
 
@@ -629,6 +728,7 @@ def parse_node(state: RAGState, retriever: Retriever) -> dict:
             "last_similarity":            float(similarity),
             "memory_used":                reason,
             "consecutive_fresh_turns":    state.get("consecutive_fresh_turns", 0) + 1,
+            "lock_start_turn":            state.get("lock_start_turn"),
             "error":                      f"Parse error: {e}",
         }
 
@@ -660,6 +760,7 @@ def retrieve_node(state: RAGState, retriever: Retriever) -> dict:
             "last_chunk_scores":   [],
             "last_chapter_number": None,
             "last_chapter_title":  None,
+            "last_section_title":  None,
             "last_filter_path":    None,
             "retrieved_chunks":    [],
             "error":               err,
@@ -667,6 +768,7 @@ def retrieve_node(state: RAGState, retriever: Retriever) -> dict:
 
     chapter_number = chunks[0].chapter_number if chunks else None
     chapter_title  = chunks[0].chapter_title  if chunks else None
+    section_title  = chunks[0].section_title  if chunks else None   # section-level anchor (v3-1)
     filter_path    = chunks[0].filter_path    if chunks else None
     chunk_ids      = [c.chunk_id     for c in chunks]
     chunk_scores   = [float(c.score) for c in chunks]   # numpy.float32 → float
@@ -688,8 +790,8 @@ def retrieve_node(state: RAGState, retriever: Retriever) -> dict:
     ]
 
     log.info(
-        "Retrieved %d chunks | chapter=%s (%s) | ids=%s",
-        len(chunks), chapter_number, chapter_title, chunk_ids,
+        "Retrieved %d chunks | chapter=%s | section=%r | ids=%s",
+        len(chunks), chapter_number, section_title, chunk_ids,
     )
 
     return {
@@ -697,6 +799,7 @@ def retrieve_node(state: RAGState, retriever: Retriever) -> dict:
         "last_chunk_scores":   chunk_scores,
         "last_chapter_number": chapter_number,
         "last_chapter_title":  chapter_title,
+        "last_section_title":  section_title,
         "last_filter_path":    filter_path,
         "retrieved_chunks":    serialised,
         "error":               None,
@@ -977,6 +1080,7 @@ class MemoryGraph:
             # Carry forward retrieval context (used by follow-up detector)
             "last_chapter_number": prev.get("last_chapter_number"),
             "last_chapter_title":  prev.get("last_chapter_title"),
+            "last_section_title":  prev.get("last_section_title"),   # section-level anchor
             "last_chunk_ids":      prev.get("last_chunk_ids", []),
             "last_chunk_scores":   prev.get("last_chunk_scores", []),
             "last_filter_path":    prev.get("last_filter_path"),
@@ -994,6 +1098,7 @@ class MemoryGraph:
 
             # Session bookkeeping
             "consecutive_fresh_turns": prev.get("consecutive_fresh_turns", 0),
+            "lock_start_turn":         prev.get("lock_start_turn"),   # max lock window
             "turn_count":              prev.get("turn_count", 0),
             "error":                   None,
             "retrieved_chunks":        [],
@@ -1001,7 +1106,36 @@ class MemoryGraph:
 
         return self.graph.invoke(input_state, config=config)
 
-    def get_history(self, student_id: str, subject: str) -> list[dict]:
+    def reset_session(self, student_id: str, subject: str) -> None:
+        """
+        Hard-wipe all checkpoint data for this student+subject session.
+
+        Deletes every row with the matching thread_id from SQLite so the next
+        run() call starts from a completely clean state — as if the student
+        had never studied this subject in this session.
+
+        Why not graph.update_state(config, {})?
+        update_state MERGES into existing state — passing {} does nothing.
+        The only correct approach is a direct DELETE on the checkpoints table.
+
+        The previous subject's thread (and any other subject) is NOT affected.
+        """
+        thread_id = _make_thread_id(student_id, subject)
+        try:
+            conn = self._checkpointer.conn
+            conn.execute(
+                "DELETE FROM checkpoints WHERE thread_id = ?",
+                (thread_id,),
+            )
+            conn.commit()
+            log.info(
+                "Session RESET | student=%s subject=%s thread=%s",
+                student_id, subject, thread_id,
+            )
+        except Exception as e:
+            log.error("reset_session failed for thread %s: %s", thread_id, e)
+
+
         """
         Return conversation history for this student+subject session.
         [MEMORY] tags are stripped from AI messages.
@@ -1040,6 +1174,7 @@ class MemoryGraph:
             "turn_count":               v.get("turn_count", 0),
             "last_chapter_number":      v.get("last_chapter_number"),
             "last_chapter_title":       v.get("last_chapter_title"),
+            "last_section_title":       v.get("last_section_title"),
             "last_chunk_ids":           v.get("last_chunk_ids", []),
             "last_chunk_scores":        v.get("last_chunk_scores", []),
             "last_answer_type":         v.get("last_answer_type"),
@@ -1047,6 +1182,7 @@ class MemoryGraph:
             "last_similarity":          v.get("last_similarity"),
             "memory_used":              v.get("memory_used"),
             "consecutive_fresh_turns":  v.get("consecutive_fresh_turns", 0),
+            "lock_start_turn":          v.get("lock_start_turn"),
             "last_topic":               (v.get("last_parsed") or {}).get("topic", ""),
             "prev_query":               v.get("prev_query"),
         }
@@ -1142,4 +1278,4 @@ if __name__ == "__main__":
     print("\nPhysics session summary:")
     print(json.dumps(mg.get_session_summary(student, "Physics"), indent=2))
     print("\nPrevious subjects studied:")
-    print(mg.list_sessions(student))
+    print(mg.list_sessions(student))        

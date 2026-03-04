@@ -412,6 +412,7 @@ def print_help(subject: str) -> None:
     [cyan]switch[/cyan]   — change subject  (currently: [green]{subject}[/green])
     [cyan]history[/cyan]  — show your full conversation history
     [cyan]summary[/cyan]  — show your study progress (chapters + chunks covered)
+    [cyan]reset[/cyan]    — clear memory for this subject and start fresh
     [cyan]help[/cyan]     — show this message
     [cyan]exit[/cyan]     — quit
 
@@ -428,6 +429,7 @@ def print_help(subject: str) -> None:
     switch   — change subject  (currently: {subject})
     history  — show your full conversation history
     summary  — show chapters and chunks studied so far
+    reset    — clear memory for this subject and start fresh
     help     — show this message
     exit     — quit
 
@@ -531,6 +533,16 @@ def main() -> None:
 
         if cmd == "help":
             print_help(active_subject)
+            continue
+
+        if cmd == "reset":
+            memory_graph.reset_session(student_id, active_subject)
+            if RICH_AVAILABLE:
+                console.print(
+                    f"  [bold yellow]✓ Session reset — {active_subject} memory cleared.[/bold yellow]\n"
+                )
+            else:
+                print(YELLOW(f"  ✓ Session reset — {active_subject} memory cleared.\n"))
             continue
 
         print()
